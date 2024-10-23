@@ -1,13 +1,14 @@
 from functools import partial
 import math
 from typing import ClassVar, Optional, Tuple, Union
-
+from jax import Array
+from numpy.typing import DTypeLike
 import jax
 from jax import ensure_compile_time_eval
-from jax.typing import DTypeLike
+from jax.typing import ArrayLike
 import jax.numpy as jnp
 from jax.tree_util import tree_map
-from mcfit import TophatVar
+from mcfit import TophatVar, GaussVar
 
 from pmwd.tree_util import pytree_dataclass
 
@@ -139,11 +140,26 @@ class Configuration:
     a_start: float = 1/64
     a_stop: float = 1
     a_lpt_maxstep: float = 1/128
-    a_nbody_maxstep: float = 1/64
+    a_nbody_num: int = 63
+    a_save: Optional[ArrayLike] = None
 
     symp_splits: Tuple[Tuple[float, float], ...] = ((0, 0.5), (1, 0.5))
 
     chunk_size: int = 2**24
+
+    # observables
+    a_snapshots: Optional[Tuple[float]] = None
+
+    # SO related
+    # type of SO method
+    # None: no SO applied
+    # 'SR': Symbolic Regression expression
+    # 'NN': Neural Net: f(k_i) * g(k_1, k_2, k_3)
+    so_type: Optional[str] = None
+    # list of the number of nodes (no input layer) of so nn
+    so_nodes: Optional[list] = None
+    soft_i: Optional[str] = None
+    softening_length: Optional[float] = None
 
     def __post_init__(self):
         if self._is_transforming():
@@ -175,6 +191,11 @@ class Configuration:
                 self,
                 'var_tophat',
                 TophatVar(self.transfer_k[1:], lowring=True, backend='jax'),
+            )
+            object.__setattr__(
+                self,
+                'var_gauss',
+                GaussVar(self.transfer_k[1:], lowring=True, backend='jax'),
             )
 
         # ~ 1.5e-8 for float64, 3.5e-4 for float32
@@ -293,11 +314,6 @@ class Configuration:
         return self.a_start / self.a_lpt_num
 
     @property
-    def a_nbody_num(self):
-        """Number of N-body time integration scale factor steps, excluding ``a_start``."""
-        return math.ceil((self.a_stop - self.a_start) / self.a_nbody_maxstep)
-
-    @property
     def a_nbody_step(self):
         """N-body time integration scale factor step size."""
         return (self.a_stop - self.a_start) / self.a_nbody_num
@@ -311,8 +327,13 @@ class Configuration:
     @property
     def a_nbody(self):
         """N-body time integration scale factor steps, including ``a_start``, of ``cosmo_dtype``."""
-        return jnp.linspace(self.a_start, self.a_stop, num=1+self.a_nbody_num,
+        a_nbody = jnp.linspace(self.a_start, self.a_stop, num=1+self.a_nbody_num,
                             dtype=self.cosmo_dtype)
+        
+        if self.a_save is not None:
+            a_nbody = jnp.concatenate([a_nbody, jnp.array(self.a_save, dtype=self.cosmo_dtype)], dtype=self.cosmo_dtype)
+            a_nbody = jnp.sort(a_nbody)
+        return a_nbody
 
     @property
     def growth_a(self):
@@ -323,3 +344,8 @@ class Configuration:
     def varlin_R(self):
         """Linear matter overdensity variance in a top-hat window of radius R in [L], of ``cosmo_dtype``."""
         return self.var_tophat.y
+
+    @property
+    def varlin_R_g(self):
+        """Linear matter overdensity variance in a Gauss window of radius R in [L], of ``cosmo_dtype``."""
+        return self.var_gauss.y

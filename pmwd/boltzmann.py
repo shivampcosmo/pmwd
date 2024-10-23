@@ -23,9 +23,10 @@ def transfer_integ(cosmo, conf):
     """
     if conf.transfer_fit:
         transfer = transfer_fit(conf.transfer_k, cosmo, conf)
-        return cosmo.replace(transfer=transfer)
     else:
-        raise NotImplementedError('TODO')
+        transfer = jnp.exp(jnp.interp(jnp.log(conf.transfer_k), jnp.log(cosmo.transfer_k_inp), jnp.log(cosmo.transfer_val_inp)))
+        # raise NotImplementedError('TODO')
+    return cosmo.replace(transfer=transfer)
 
 
 # TODO Wayne's website: neutrino no wiggle case
@@ -155,8 +156,8 @@ def transfer(k, cosmo, conf):
     if conf.transfer_fit:
         T = jnp.interp(k, conf.transfer_k, cosmo.transfer)
     else:
-        raise NotImplementedError('TODO')
-
+        T = jnp.exp(jnp.interp(jnp.log(k), jnp.log(cosmo.transfer_k_inp), jnp.log(cosmo.transfer_val_inp)))
+        # raise NotImplementedError('TODO')
     return T.astype(float_dtype)
 
 
@@ -287,8 +288,9 @@ def varlin_integ(cosmo, conf):
     Plin = linear_power(conf.var_tophat.x, None, cosmo, conf)
 
     _, varlin = conf.var_tophat(Plin, extrap=True)
+    _, varlin_g = conf.var_gauss(Plin, extrap=True)
 
-    return cosmo.replace(varlin=varlin)
+    return cosmo.replace(varlin=varlin, varlin_g=varlin_g)
 
 
 def varlin(R, a, cosmo, conf):

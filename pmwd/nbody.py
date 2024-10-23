@@ -1,12 +1,16 @@
 from functools import partial
 
+import jax
 from jax import value_and_grad, jit, vjp, custom_vjp
 import jax.numpy as jnp
 from jax.tree_util import tree_map
+from jax.lax import cond, scan, while_loop
 
 from pmwd.boltzmann import growth
 from pmwd.cosmology import E2, H_deriv
 from pmwd.gravity import gravity
+from pmwd.obs_util import interptcl, itp_prev_adj, itp_next_adj
+from pmwd.particles import Particles
 
 
 def _G_D(a, cosmo, conf):
@@ -183,11 +187,93 @@ def coevolve_init(a, ptcl, cosmo, conf):
 
 
 def observe(a_prev, a_next, ptcl, obsvbl, cosmo, conf):
-    pass
+    i = jnp.searchsorted(obsvbl['a_snaps'], a_prev, side='left')
+    j = jnp.searchsorted(obsvbl['a_snaps'], a_next, side='left')
+    init_state = (i, j, obsvbl)
+
+    def cond_fun(state):
+        i, j, _ = state
+        return i < j
+
+    def body_fun(state):
+        i, j, obsvbl = state
+        a_snap = obsvbl['a_snaps'][i]
+        snap_itp = interptcl(obsvbl['ptcl_prev'], ptcl, a_prev, a_next, a_snap, cosmo)
+        obsvbl['snaps'] = obsvbl['snaps'].replace(
+            disp=obsvbl['snaps'].disp.at[i].set(snap_itp.disp),
+            vel=obsvbl['snaps'].vel.at[i].set(snap_itp.vel))
+        return (i + 1, j, obsvbl)
+
+    _, _, obsvbl = while_loop(cond_fun, body_fun, init_state)
+
+    obsvbl['ptcl_prev'] = ptcl
+
+    return obsvbl
 
 
 def observe_init(a, ptcl, obsvbl, cosmo, conf):
-    pass
+    # a dict to carry all observables and related useful information
+    obsvbl = {}
+
+    # to carry the prev ptcl, starting with lpt ptcl
+    obsvbl['ptcl_prev'] = ptcl
+
+    if conf.a_snapshots is not None:
+        obsvbl['a_snaps'] = jnp.array(conf.a_snapshots)
+        # all output snapshots, at times given by conf.a_snapshots
+        obsvbl['snaps'] = [Particles(ptcl.conf, ptcl.pmid, jnp.zeros_like(ptcl.disp),
+                           vel=jnp.zeros_like(ptcl.vel))] * len(conf.a_snapshots)
+        # transposed pytree with leading axis for scan
+        obsvbl['snaps'] = tree_map(lambda *xs: jnp.stack(xs), *obsvbl['snaps'])
+
+        # the nbody a step of output snapshots, (,]
+        idx = jnp.searchsorted(conf.a_nbody, jnp.array(conf.a_snapshots), side='left')
+        obsvbl['snap_a_step'] = jnp.array((conf.a_nbody[idx-1], conf.a_nbody[idx])).T
+
+    return obsvbl
+
+
+def observe_adj(a_prev, a_next, ptcl, ptcl_cot, obsvbl, obsvbl_cot, cosmo, cosmo_cot, conf):
+
+    def itp_cond_adj(carry, x):
+        ptcl_cot, cosmo_cot = carry
+        a_snap, a_step, snap_cot = x
+        ptcl_cot, cosmo_cot = cond(a_step[1] == a_next, itp_next_adj,
+                                   lambda *args: (ptcl_cot, cosmo_cot),
+                                   ptcl_cot, cosmo_cot, snap_cot, ptcl,
+                                   a_step[0], a_step[1], a_snap, cosmo)
+        ptcl_cot, cosmo_cot = cond(a_step[1] == a_prev, itp_prev_adj,
+                                   lambda *args: (ptcl_cot, cosmo_cot),
+                                   ptcl_cot, cosmo_cot, snap_cot, ptcl,
+                                   a_step[0], a_step[1], a_snap, cosmo)
+        return (ptcl_cot, cosmo_cot), None
+
+    if conf.a_snapshots is not None:
+        ptcl_cot, cosmo_cot = scan(itp_cond_adj, (ptcl_cot, cosmo_cot),
+                                   (obsvbl['a_snaps'], obsvbl['snap_a_step'],
+                                   obsvbl_cot['snaps']))[0]
+
+    return ptcl_cot, cosmo_cot
+
+
+def observe_adj_init(a, ptcl, ptcl_cot, obsvbl, obsvbl_cot, cosmo, cosmo_cot, conf):
+
+    def itp_cond_adj(carry, x):
+        ptcl_cot, cosmo_cot = carry
+        a_snap, a_step, snap_cot = x
+        ptcl_cot, cosmo_cot = cond(a_step[1] == a, itp_next_adj,
+                                   lambda *args: (ptcl_cot, cosmo_cot),
+                                   ptcl_cot, cosmo_cot, snap_cot, ptcl,
+                                   a_step[0], a_step[1], a_snap, cosmo)
+        return (ptcl_cot, cosmo_cot), None
+
+    if conf.a_snapshots is not None:
+        # check if the last ptcl is used in interpolation
+        ptcl_cot, cosmo_cot = scan(itp_cond_adj, (ptcl_cot, cosmo_cot),
+                                   (obsvbl['a_snaps'], obsvbl['snap_a_step'],
+                                   obsvbl_cot['snaps']))[0]
+
+    return ptcl_cot, cosmo_cot
 
 
 @jit
@@ -218,14 +304,27 @@ def nbody(ptcl, obsvbl, cosmo, conf, reverse=False):
     a_nbody = conf.a_nbody[::-1] if reverse else conf.a_nbody
 
     ptcl, obsvbl = nbody_init(a_nbody[0], ptcl, obsvbl, cosmo, conf)
+    if conf.a_save is not None:
+        if jnp.any(jnp.abs(a_nbody[0] - conf.a_save) < 1e-3):
+            ptcl_all_save = {f'{a_nbody[0]:.3f}':ptcl}
+            obsvbl_all_save = {f'{a_nbody[0]:.3f}':obsvbl}
+        else:
+            ptcl_all_save = {}
+            obsvbl_all_save = {}
     for a_prev, a_next in zip(a_nbody[:-1], a_nbody[1:]):
         ptcl, obsvbl = nbody_step(a_prev, a_next, ptcl, obsvbl, cosmo, conf)
-    return ptcl, obsvbl
+        if conf.a_save is not None:
+            if jnp.any(jnp.abs(a_next - conf.a_save) < 1e-3):
+                ptcl_all_save[f'{a_next:.3f}'] = ptcl
+                obsvbl_all_save[f'{a_next:.3f}'] = obsvbl
+    if conf.a_save is not None:
+        return ptcl_all_save, obsvbl_all_save
+    else:
+        return ptcl, obsvbl
 
 
 @jit
-def nbody_adj_init(a, ptcl, ptcl_cot, obsvbl_cot, cosmo, conf):
-    #ptcl_cot = observe_adj(a_prev, a_next, ptcl, ptcl_cot, obsvbl_cot, cosmo)
+def nbody_adj_init(a, ptcl, ptcl_cot, obsvbl, obsvbl_cot, cosmo, conf):
 
     #ptcl, ptcl_cot = coevolve_adj(a_prev, a_next, ptcl, ptcl_cot, cosmo)
 
@@ -233,44 +332,53 @@ def nbody_adj_init(a, ptcl, ptcl_cot, obsvbl_cot, cosmo, conf):
 
     cosmo_cot = tree_map(jnp.zeros_like, cosmo)
 
+    ptcl_cot, cosmo_cot = observe_adj_init(a, ptcl, ptcl_cot, obsvbl, obsvbl_cot,
+                                           cosmo, cosmo_cot, conf)
+
     return ptcl, ptcl_cot, cosmo_cot, cosmo_cot_force
 
 
 @jit
-def nbody_adj_step(a_prev, a_next, ptcl, ptcl_cot, obsvbl_cot, cosmo, cosmo_cot, cosmo_cot_force, conf):
-    #ptcl_cot = observe_adj(a_prev, a_next, ptcl, ptcl_cot, obsvbl_cot, cosmo, conf)
+def nbody_adj_step(a_prev, a_next, ptcl, ptcl_cot, obsvbl, obsvbl_cot,
+                   cosmo, cosmo_cot, cosmo_cot_force, conf):
 
     #ptcl, ptcl_cot = coevolve_adj(a_prev, a_next, ptcl, ptcl_cot, cosmo, conf)
 
     ptcl, ptcl_cot, cosmo_cot, cosmo_cot_force = integrate_adj(
         a_prev, a_next, ptcl, ptcl_cot, obsvbl_cot, cosmo, cosmo_cot, cosmo_cot_force, conf)
 
+    ptcl_cot, cosmo_cot = observe_adj(a_prev, a_next, ptcl, ptcl_cot, obsvbl, obsvbl_cot,
+                                      cosmo, cosmo_cot, conf)
+
     return ptcl, ptcl_cot, cosmo_cot, cosmo_cot_force
 
 
-def nbody_adj(ptcl, ptcl_cot, obsvbl_cot, cosmo, conf, reverse=False):
+def nbody_adj(ptcl, ptcl_cot, obsvbl, obsvbl_cot, cosmo, conf, reverse=False):
     """N-body time integration with adjoint equation."""
     a_nbody = conf.a_nbody[::-1] if reverse else conf.a_nbody
 
     ptcl, ptcl_cot, cosmo_cot, cosmo_cot_force = nbody_adj_init(
-        a_nbody[-1], ptcl, ptcl_cot, obsvbl_cot, cosmo, conf)
+        a_nbody[-1], ptcl, ptcl_cot, obsvbl, obsvbl_cot, cosmo, conf)
+
     for a_prev, a_next in zip(a_nbody[:0:-1], a_nbody[-2::-1]):
         ptcl, ptcl_cot, cosmo_cot, cosmo_cot_force = nbody_adj_step(
-            a_prev, a_next, ptcl, ptcl_cot, obsvbl_cot, cosmo, cosmo_cot, cosmo_cot_force, conf)
+            a_prev, a_next, ptcl, ptcl_cot, obsvbl, obsvbl_cot,
+            cosmo, cosmo_cot, cosmo_cot_force, conf)
+
     return ptcl, ptcl_cot, cosmo_cot
 
 
 def nbody_fwd(ptcl, obsvbl, cosmo, conf, reverse):
     ptcl, obsvbl = nbody(ptcl, obsvbl, cosmo, conf, reverse)
-    return (ptcl, obsvbl), (ptcl, cosmo, conf)
+    return (ptcl, obsvbl), (ptcl, obsvbl, cosmo, conf)
 
 def nbody_bwd(reverse, res, cotangents):
-    ptcl, cosmo, conf = res
+    ptcl, obsvbl, cosmo, conf = res
     ptcl_cot, obsvbl_cot = cotangents
 
-    ptcl, ptcl_cot, cosmo_cot = nbody_adj(ptcl, ptcl_cot, obsvbl_cot, cosmo, conf,
-                                          reverse=reverse)
+    ptcl, ptcl_cot, cosmo_cot = nbody_adj(
+        ptcl, ptcl_cot, obsvbl, obsvbl_cot, cosmo, conf, reverse=reverse)
 
-    return ptcl_cot, obsvbl_cot, cosmo_cot, None
+    return ptcl_cot, None, cosmo_cot, None
 
 nbody.defvjp(nbody_fwd, nbody_bwd)

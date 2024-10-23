@@ -4,6 +4,7 @@ from jax import custom_vjp
 from pmwd.scatter import scatter
 from pmwd.gather import gather
 from pmwd.pm_util import fftfreq, fftfwd, fftinv
+from pmwd.sto.so import sotheta, pot_sharp, grad_sharp
 
 
 @custom_vjp
@@ -57,9 +58,16 @@ def gravity(a, ptcl, cosmo, conf):
 
     pot = laplace(kvec, dens, cosmo)
 
+    if conf.so_type is not None:  # spatial optimization
+        theta = sotheta(cosmo, conf, a)
+        pot = pot_sharp(pot, kvec, theta, cosmo, conf, a)
+
     acc = []
     for k in kvec:
         grad = neg_grad(k, pot, conf.cell_size)
+
+        if conf.so_type is not None:  # spatial optimization
+            grad = grad_sharp(grad, k, theta, cosmo, conf, a)
 
         grad = fftinv(grad, shape=conf.mesh_shape)
         grad = grad.astype(conf.float_dtype)  # no jnp.complex32
